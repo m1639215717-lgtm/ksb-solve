@@ -149,11 +149,25 @@ def run(paperid, method):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=os.environ.get("KSB_HEADLESS", "0") == "1",
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled",
+                  "--disable-features=IsolateOrigins,site-per-process"],
         )
         ctx = browser.new_context(viewport={"width": 1280, "height": 960},
-                                  user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+                                  user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                  locale="zh-CN", timezone_id="Asia/Shanghai")
         page = ctx.new_page()
+        # 彻底隐藏自动化指纹
+        page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+        window.chrome = {runtime: {}};
+        const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+        if (origQuery) {
+          window.navigator.permissions.query = (p) => (p.name === 'notifications')
+            ? Promise.resolve({state: Notification.permission}) : origQuery(p);
+        }
+        """)
         page.goto(url, wait_until="networkidle", timeout=90000)
         try:
             page.wait_for_selector("#tCaptchaDyMainWrap", timeout=15000)
@@ -281,6 +295,24 @@ def run(paperid, method):
         sx = slider_box["x"] + slider_box["width"]/2
         sy = slider_box["y"] + slider_box["height"]/2
 
+        # 读取腾讯验证码当前状态(诊断为何失败)
+        def captcha_state():
+            try:
+                st = page.evaluate("""() => {
+                  try {
+                    const els = document.querySelectorAll('#tCaptchaDyMainWrap [class]');
+                    let texts=[];
+                    els.forEach(e=>{const t=(e.textContent||'').trim(); if(t && t.length<40) texts.push(t);});
+                    const msg = texts.find(t=>/失败|重试|太快|正确|安全|拼图|异常|点击/.test(t));
+                    const fail = !!document.querySelector('.tencent-captcha-dy__slider-img--fail');
+                    const success = !!document.querySelector('.tencent-captcha-dy__slider-img--success, .tencent-captcha-dy__verify-status-img--success');
+                    return {msg: msg||null, fail, success};
+                  } catch(e){ return {err:String(e)}; }
+                }""")
+                return st
+            except Exception as e:
+                return {"err": str(e)[:60]}
+
         # 判定验证是否通过: 验证码容器消失 或 页面出现登录token
         def captcha_passed():
             try:
@@ -313,6 +345,8 @@ def run(paperid, method):
             page.wait_for_timeout(random.randint(60, 160))
             page.mouse.up()
             page.wait_for_timeout(1800)
+            st = captcha_state()
+            print(f"    状态: msg={st.get('msg')} fail={st.get('fail')} success={st.get('success')}", flush=True)
             if captcha_passed():
                 passage = cxx
                 print(f"✅ 验证通过于候选x={cxx}!", flush=True)
