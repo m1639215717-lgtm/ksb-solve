@@ -116,18 +116,29 @@ def locate_gap(bg_bgr, piece_bgr):
 
 
 def human_track(start, end, dur=0.9):
+    """生成人类似的 (x, y) 轨迹点列表。含水平缓动 + 垂直抖动 + 过冲回弹。
+    start/end 是水平像素; y 在基线上有 ±2px 抖动(真人拖动不完全水平)。"""
     np_rng = np.random.default_rng()
-    steps = int(dur * 120)
-    pts = [start]
+    steps = max(20, int(dur * 120))
+    pts = [(start, 0.0)]
     for i in range(1, steps + 1):
         t = i / steps
-        eased = start + (end - start) * (1 - (1 - t) ** 5)
-        eased += float(np_rng.uniform(-1.5, 1.5)) * (1 - t)
-        pts.append(int(eased))
-    overshoot = random.randint(2, 5)
-    pts.append(pts[-1] + overshoot)
-    pts.append(pts[-1] - overshoot)
-    pts.append(end)
+        # easeInOut: 起慢-中快-末慢, 更接近真人
+        if t < 0.5:
+            eased = start + (end - start) * (2 * t * t)
+        else:
+            u = 2 * t - 1
+            eased = start + (end - start) * (1 - ((-(u*u) + 2*u) * 0.5))
+        # 水平抖动(前段小, 末段趋零)
+        eased += float(np_rng.uniform(-2.5, 2.5)) * (1 - t) * (0.6 + 0.4*abs(t-0.5))
+        # 垂直抖动 ±2px
+        yj = float(np_rng.uniform(-2.2, 2.2)) * (1 - t)
+        pts.append((max(start, int(eased)), yj))
+    # 过冲回弹(水平 + 垂直微动)
+    over = random.randint(3, 6)
+    pts.append((pts[-1][0] + over, float(np_rng.uniform(-1,1))))
+    pts.append((pts[-1][0] - over, float(np_rng.uniform(-1,1))))
+    pts.append((end, 0.0))
     return pts
 
 
@@ -285,28 +296,36 @@ def run(paperid, method):
         for idx, cxx in enumerate(cands):
             dist = int(round(cxx * ratio))
             print(f"[尝试{idx+1}/{len(cands)}] 缺口候选x={cxx} 拖动={dist}px", flush=True)
-            # 重置滑块到起点
-            page.mouse.move(sx, sy)
-            page.mouse.down()
+            # 在滑块元素上按下并拖动(浏览器原生级, 腾讯能收到真实指针事件)
+            try:
+                page.mouse.move(sx, sy)
+                page.wait_for_timeout(random.randint(80, 200))
+                page.mouse.down()
+                page.wait_for_timeout(random.randint(30, 90))
+            except Exception as e:
+                print("down err", repr(e)[:60], flush=True)
             track = human_track(0, dist)
-            for px in track:
-                page.mouse.move(sx + px, sy, steps=1)
-                page.wait_for_timeout(random.randint(6, 14))
+            for px, yj in track:
+                page.mouse.move(sx + px, sy + yj, steps=1)
+                # 真实人非匀速: 停顿有时长有时短
+                page.wait_for_timeout(random.choice([3,4,5,6,8,10,13,16]))
+            # 释放前微停
+            page.wait_for_timeout(random.randint(60, 160))
             page.mouse.up()
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1800)
             if captcha_passed():
                 passage = cxx
                 print(f"✅ 验证通过于候选x={cxx}!", flush=True)
                 break
-            # 失败回弹: 把滑块拖回起点附近以便下一候选
+            # 失败回弹: 拖回起点, 便于下一候选
             try:
                 page.mouse.move(sx, sy)
                 page.mouse.down()
-                page.mouse.move(sx + random.randint(6,20), sy, steps=1)
+                page.mouse.move(sx + random.randint(6, 20), sy, steps=2)
                 page.mouse.up()
             except Exception:
                 pass
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(700)
 
         page.wait_for_timeout(2500)
         cookies = ctx.cookies()
