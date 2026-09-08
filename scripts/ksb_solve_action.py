@@ -89,27 +89,29 @@ def locate_gap(bg_bgr, piece_bgr):
                 return result
         except BaseException:
             CV_MT_OK = False
-    # edge 兜底
-    grad = np.abs(cv2.Sobel(bg, cv2.CV_32F, 1, 0, ksize=3))
-    col = grad.mean(axis=0)
-    mean, std = float(col.mean()), float(col.std())
-    thr = mean + 1.8 * std
-    over = [i for i, v in enumerate(col) if v > thr]
+    # edge 兜底: 缺口 = 背景中持续变暗的竖带中心 (实测缺口 x≈164)
+    H, W = bg.shape
+    y0, y1 = int(H*0.35), int(H*0.85)
+    region = bg[y0:y1, :]
+    colmean = region.mean(axis=0)
+    thr = 190.0
+    dark = [i for i, v in enumerate(colmean) if v < thr]
     groups = []
-    for x in over:
-        if groups and x - groups[-1][-1] <= 6:
+    for x in dark:
+        if groups and x - groups[-1][-1] <= 3:
             groups[-1].append(x)
         else:
             groups.append([x])
-    bands = [((g[0] + g[-1]) // 2) for g in groups]
     best = None
-    for c1 in bands:
-        for c2 in bands:
-            if 30 <= (c2 - c1) <= 160:
-                best = (c1 + c2) // 2
-    if best is None and bands:
-        best = bands[len(bands)//2]
-    result = {"x": best, "method": "edge"}
+    for grp in groups:
+        if len(grp) >= 4:
+            x0, x1 = grp[0], grp[-1]
+            if 20 < x0 and x1 < W - 20:
+                c = (x0 + x1) // 2
+                if best is None or len(grp) > best[0]:
+                    best = (len(grp), c)
+    best_x = best[1] if best else int(np.argmin(colmean))
+    result = {"x": best_x, "method": "edge"}
     return result
 
 
