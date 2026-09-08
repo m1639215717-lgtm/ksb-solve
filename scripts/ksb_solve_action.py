@@ -367,45 +367,40 @@ def run(paperid, method):
             return gone or has_full_tok
 
         passage = None
-        # 用 CDP Input 事件驱动拖动(trusted 事件, 腾讯能识别为真输入, 而 page.mouse 是合成事件)
-        try:
-            cdp = page.context.new_cdp_session(page)
-        except Exception as e:
-            print("cdp init fail", repr(e)[:60], flush=True); cdp = None
-        def cdp_move(x, y, buttons=1):
-            if cdp:
-                cdp.send("Input.dispatchMouseEvent", {"type":"mouseMoved","x":x,"y":y,
-                        "button":"left","buttons":buttons})
-            else:
-                page.mouse.move(x, y)
-        def cdp_down(x, y):
-            if cdp:
-                cdp.send("Input.dispatchMouseEvent", {"type":"mousePressed","x":x,"y":y,
-                        "button":"left","buttons":1,"clickCount":1})
-            else:
-                page.mouse.move(x,y); page.mouse.down()
-        def cdp_up(x, y):
-            if cdp:
-                cdp.send("Input.dispatchMouseEvent", {"type":"mouseReleased","x":x,"y":y,
-                        "button":"left","buttons":0,"clickCount":1})
-            else:
-                page.mouse.up()
+        # 腾讯滑块监听 PointerEvent。用 dispatchEvent 在滑块块上派发 pointer 序列。
+        def drag_by_pointer(dist):
+            """在 .slider-block 元素上派发 pointerdown/pointermove/pointerup 完成拖动。"""
+            res = page.evaluate("""(dist) => {
+              const el=document.querySelector('.tencent-captcha-dy__slider-block');
+              if(!el) return {err:'no slider-block'};
+              const r=el.getBoundingClientRect();
+              const cx=r.x+r.width/2, cy=r.y+r.height/2;
+              const mk=(x,y,type)=>({pointerId:1,pointerType:'mouse',isPrimary:true,
+                clientX:x,clientY:y,button:0,buttons: type==='pointermove'?1:0,
+                bubbles:true,cancelable:true,composed:true,width:1,height:1,pressure:1});
+              const fire=(t,x,y)=>el.dispatchEvent(new PointerEvent(t,mk(x,y,t)));
+              fire('pointerdown',cx,cy);
+              const steps=Math.max(14,Math.abs(dist)>>2);
+              for(let i=1;i<=steps;i++){
+                const cur=dist*i/steps;
+                const yj=(Math.random()-0.5)*3;
+                fire('pointermove', cx+cur, cy+yj);
+                el.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,clientX:cx+cur,clientY:cy+yj,button:0,buttons:1}));
+              }
+              fire('pointerup',cx+dist,cy);
+              el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,clientX:cx+dist,clientY:cy}));
+              return {ok:true, dist};
+            }""", dist)
+            page.wait_for_timeout(1500)
+            return res
 
         for idx, cxx in enumerate(cands):
             dist = int(round(cxx * ratio))
             print(f"[尝试{idx+1}/{len(cands)}] 缺口候选x={cxx} 拖动={dist}px", flush=True)
             try:
-                cdp_down(sx, sy)
-                page.wait_for_timeout(random.randint(40, 120))
+                drag_by_pointer(dist)
             except Exception as e:
-                print("down err", repr(e)[:60], flush=True)
-            track = human_track(0, dist)
-            for px, yj in track:
-                cdp_move(sx + px, sy + yj)
-                page.wait_for_timeout(random.choice([4,5,6,8,11,14,17]))
-            # 释放前微停
-            page.wait_for_timeout(random.randint(60, 180))
-            cdp_up(sx + dist, sy)
+                print("drag err", repr(e)[:60], flush=True)
             page.wait_for_timeout(2000)
             st = captcha_state()
             off = slider_offset()
@@ -414,14 +409,6 @@ def run(paperid, method):
                 passage = cxx
                 print(f"✅ 验证通过于候选x={cxx}!", flush=True)
                 break
-            # 失败回弹: 拖回起点, 便于下一候选
-            try:
-                cdp_move(sx, sy); page.wait_for_timeout(30)
-                cdp_down(sx, sy)
-                cdp_move(sx + random.randint(6,20), sy)
-                cdp_up(sx + random.randint(6,20), sy)
-            except Exception:
-                pass
             page.wait_for_timeout(700)
 
         page.wait_for_timeout(2500)
