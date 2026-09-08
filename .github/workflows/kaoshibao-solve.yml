@@ -1,0 +1,57 @@
+name: ksb-solve-export
+
+on:
+  workflow_dispatch:
+    inputs:
+      paperid:
+        description: "题库 paperid"
+        required: true
+        default: "14581066"
+      method:
+        description: "缺口检测: template 或 edge"
+        required: false
+        default: "template"
+
+permissions:
+  contents: read
+
+jobs:
+  solve-and-export:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python + OpenCV + Playwright
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip libgl1 libglib2.0-0
+          pip install --quiet opencv-python-headless numpy requests
+          pip install --quiet playwright
+          python3 -m playwright install chromium --with-deps
+        env:
+          # 不要指向 /root (runner 无写权限)。用 runner HOME 下可写路径。
+          PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+
+      - name: Run 滑块过验 + 补全导出
+        id: solve
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+        run: |
+          # 完整 OpenCV 模板匹配通道
+          export KSB_USE_TEMPLATE=1
+          export KSB_HEADLESS=1
+          python3 scripts/ksb_solve_action.py --paperid "${{ inputs.paperid }}" --method "${{ inputs.method }}"
+          ls -la output/ 2>/dev/null || echo "no output dir"
+
+      - name: Upload 导出文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: 题库导出
+          path: |
+            output/*.xlsx
+            output/*.json
+            output/*.png
+            output/*log*.txt
+          if-no-files-found: warn
