@@ -229,38 +229,92 @@ def run(paperid, method):
             if b and b["width"]:
                 cb = b["width"]
         ratio = cb / 220.0
-        dist = int(round(gap["x"] * ratio))
-        print(f"背景显示宽={round(cb,1)} 缩放={round(ratio,3)} 缺口x={gap['x']} 拖动距离={dist}px", flush=True)
 
-        sx = slider_box["x"] + slider_box["width"] / 2
-        sy = slider_box["y"] + slider_box["height"] / 2
-        print(f"滑块起点 sx={round(sx,1)} sy={round(sy,1)}", flush=True)
-        page.mouse.move(sx, sy)
-        page.mouse.down()
-        track = human_track(0, dist)
-        for px in track:
-            page.mouse.move(sx + px, sy, steps=1)
-            page.wait_for_timeout(random.randint(6, 14))
-        page.mouse.up()
-        print("已释放滑块，等待验证结果…", flush=True)
-        page.wait_for_timeout(3500)
+        # 生成候选缺口位置(基于已检出的gap.x ± 偏移量, 加扫描点)
+        base_x = gap.get("x") or 190
+        candidates = []
+        for off in [0, -8, 8, -16, 16, -24, 24, -32, 32, -12, 12, -4, 4]:
+            candidates.append(base_x + off)
+        # 再补覆盖不同猜测区间
+        candidates += [198, 205, 182, 176, 168, 160, 150, 145]
+        candidates = [c for c in candidates if 20 < c < 205]
+        # 去重保序
+        seen = set(); cands=[]
+        for c in candidates:
+            if c not in seen:
+                seen.add(c); cands.append(c)
 
-        # 过验后 cookie/token —— 从 cookie 捕获 ticket/身份
+        # 定位可拖拽滑块
+        def _box(sel):
+            el = page.query_selector(sel)
+            if not el: return None
+            return el.bounding_box()
+        def find_valid_slider():
+            for sel in [".tencent-captcha-dy__slider-block",
+                        ".tencent-captcha-dy__slider-groove",
+                        ".tencent-captcha-dy__slider",
+                        ".tencent-captcha-dy__opera-area"]:
+                try:
+                    b = _box(sel)
+                    if b and b.get("width") and b.get("height") and b.get("width") > 4:
+                        return b
+                except Exception:
+                    pass
+            return None
+        slider_box = find_valid_slider()
+        if not slider_box:
+            print("❌ 找不到滑块元素", flush=True)
+            browser.close(); return
+        sx = slider_box["x"] + slider_box["width"]/2
+        sy = slider_box["y"] + slider_box["height"]/2
+
+        # 判定验证是否通过: 验证码容器消失 或 页面出现登录token
+        def captcha_passed():
+            try:
+                gone = page.query_selector("#tCaptchaDyMainWrap") is None
+            except Exception:
+                gone = True
+            # cookie token 判断
+            tok = next((c["value"] for c in ctx.cookies() if c["name"]=="token"), None)
+            has_full_tok = bool(tok and len(tok) > 8)
+            return gone or has_full_tok
+
+        passage = None
+        for idx, cxx in enumerate(cands):
+            dist = int(round(cxx * ratio))
+            print(f"[尝试{idx+1}/{len(cands)}] 缺口候选x={cxx} 拖动={dist}px", flush=True)
+            # 重置滑块到起点
+            page.mouse.move(sx, sy)
+            page.mouse.down()
+            track = human_track(0, dist)
+            for px in track:
+                page.mouse.move(sx + px, sy, steps=1)
+                page.wait_for_timeout(random.randint(6, 14))
+            page.mouse.up()
+            page.wait_for_timeout(1500)
+            if captcha_passed():
+                passage = cxx
+                print(f"✅ 验证通过于候选x={cxx}!", flush=True)
+                break
+            # 失败回弹: 把滑块拖回起点附近以便下一候选
+            try:
+                page.mouse.move(sx, sy)
+                page.mouse.down()
+                page.mouse.move(sx + random.randint(6,20), sy, steps=1)
+                page.mouse.up()
+            except Exception:
+                pass
+            page.wait_for_timeout(800)
+
+        page.wait_for_timeout(2500)
         cookies = ctx.cookies()
-        browsertok = next((c["value"] for c in cookies if c["name"] == "token"), None)
-        # 尝试从 JS 读取腾讯回填空余字段(如有)
-        ticket = None
-        try:
-            ticket = page.evaluate("()=>{try{return window.__tc_ticket||document.querySelector('input[name=ticket]')?.value||''}catch(e){return ''}}")
-        except Exception:
-            ticket = None
-        print("过验 cookie token:", (browsertok[:12] + "…" if browsertok else None),
-              "ticket:", (str(ticket)[:16] + "…" if ticket else None), flush=True)
-
-        dump = {"paperid": paperid, "gap": gap, "token": browsertok, "ticket": ticket}
+        browsertok = next((c["value"] for c in cookies if c["name"]=="token"), None)
+        print("过验 token:", (browsertok[:12]+"…" if browsertok else None),
+              "| passed_candidate:", passage, flush=True)
+        dump = {"paperid": paperid, "gap": gap, "token": browsertok,
+                "passed_candidate": passage}
         with open(os.path.join(OUT, "result.json"), "w") as f:
             json.dump(dump, f, ensure_ascii=False, indent=2)
-        # 文件落到 output 供 artifact 下载
         print("完成。产物见 output/", flush=True)
         browser.close()
 
