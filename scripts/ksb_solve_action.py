@@ -294,6 +294,26 @@ def run(paperid, method):
             browser.close(); return
         sx = slider_box["x"] + slider_box["width"]/2
         sy = slider_box["y"] + slider_box["height"]/2
+        print(f"滑块定位: box=({round(slider_box['x'],1)},{round(slider_box['y'],1)} {round(slider_box['width'],1)}x{round(slider_box['height'],1)}) sx={round(sx,1)} sy={round(sy,1)}", flush=True)
+
+        # 读取滑块当前位移(验证拖动是否生效)
+        def slider_offset():
+            try:
+                v = page.evaluate("""() => {
+                  const el=document.querySelector('.tencent-captcha-dy__slider-block');
+                  if(!el) return null;
+                  const s=el.style.transform||getComputedStyle(el).transform;
+                  let mx=0;
+                  const m=s.match(/translate3?d?\\(([-\\d.]+)px/);
+                  if(m) mx=parseFloat(m[1]);
+                  else { const lm=(el.style.left||'').match(/[-\\d.]+/); if(lm) mx=parseFloat(lm[0]); }
+                  return {transform:s, x:mx};
+                }""")
+                return v
+            except Exception as e:
+                return {"err": str(e)[:50]}
+        init_off = slider_offset()
+        print(f"拖动前滑块transform: {init_off}", flush=True)
 
         # 读取腾讯验证码当前状态(诊断为何失败)
         def captcha_state():
@@ -366,7 +386,8 @@ def run(paperid, method):
             cdp_up(sx + dist, sy)
             page.wait_for_timeout(2000)
             st = captcha_state()
-            print(f"    状态: msg={st.get('msg')} fail={st.get('fail')} success={st.get('success')}", flush=True)
+            off = slider_offset()
+            print(f"    状态: msg={st.get('msg')} | 滑块offset={off}", flush=True)
             if captcha_passed():
                 passage = cxx
                 print(f"✅ 验证通过于候选x={cxx}!", flush=True)
