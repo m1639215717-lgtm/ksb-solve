@@ -272,6 +272,28 @@ def run(paperid, method):
                 seen.add(c); cands.append(c)
 
         # 定位可拖拽滑块
+        # 关键: 腾讯验证码默认被 translateY(-1000000px) 隐藏。必须先把容器移到可见区，
+        # 否则 slider 的 bounding_box y≈-999825(屏幕外), 鼠标事件全落在空白处, 拖动无效。
+        try:
+            page.evaluate("""() => {
+              const wrap=document.querySelector('#tCaptchaDyMainWrap');
+              if(wrap){
+                // 复位隐藏, 再定位到屏幕内可见
+                wrap.style.transform='translateY(0px)';
+                wrap.style.position='fixed';
+                wrap.style.left='0px';
+                wrap.style.top='200px';
+                wrap.style.zIndex='2147483647';
+                wrap.style.visibility='visible';
+                wrap.style.opacity='1';
+              }
+              return !!wrap;
+            }""")
+            page.wait_for_timeout(600)
+            print("已将验证码容器移到可见区", flush=True)
+        except Exception as e:
+            print("移容器失败", repr(e)[:60], flush=True)
+
         def _box(sel):
             el = page.query_selector(sel)
             if not el: return None
