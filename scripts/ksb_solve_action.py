@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+考试宝滑块自动过验 + 题库补全导出   (GitHub Actions / 标准Linux 运行版)
+========================================================================
+设计:
+  1) Playwright headless Chromium 打开题库页 (考试宝触验证码)
+  2) 抓取验证码背景图 + 拼图小块 (220x220 背景 / 124x124 拼图)
+  3) OpenCV 模板匹配(完整版) 或 边缘列扫描 定位缺口中心X
+  4) 人类式拖拽轨迹拖动滑块
+  5) 过验后拿 token -> 补全加密区题目 (复用 /questions/* 接口)
+  6) 导出 .xlsx / .json 到 output/
+
+运行:
+  export KSB_USE_TEMPLATE=1   (启用完整模板匹配通道)
+  python3 scripts/ksb_solve_action.py --paperid 14581066 --method template
+"""
+import argparse, base64, hashlib, json, os, random, re, sys, time, uuid
+import urllib.parse, urllib.request
+import numpy as np
+
+# ---------- 环境 ----------
+OUT = os.path.abspath("output")
+os.makedirs(OUT, exist_ok=True)
+use_template = os.environ.get("KSB_USE_TEMPLATE", "0") in ("1", "true", "yes")
+
+import cv2
+CV_MT_OK = use_template  # 在 ubuntu 完整 build 上 matchTemplate 可用
+
+# 测试: 安全起见, 崩溃配置时退回 edge
+def _mt_ok():
+    try:
+        g = (np.random.rand(40, 40) * 255).astype("uint8")
+        cv2.matchTemplate(g, g[4:36, 4:36], cv2.TM_CCOEFF_NORMED)
+        return True
+    except Exception:
+        return False
+
+if CV_MT_OK:
+    try:
+        CV_MT_OK = _mt_ok()
+    except BaseException:
+        CV_MT_OK = False
+
+# ---------- 考试宝接口 ----------
+SECRET = "12b6bb84e093532fb72b4d65fec3f00b"
+BASE = "https://api.ankianki.com"
+UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_3 like Mac OS X) "
+      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Mobile/15E148 Safari/604.1")
+
+
+def _sign(path, uid, ts):
+    return hashlib.md5((SECRET + uid + path + ts + SECRET).encode()).hexdigest()
+
+
+def ksb(path, data=None, uid=None, token=None):
+    uid = uid or str(uuid.uuid4()).lower()
+    ts = str(int(time.time() * 1000))
+    url = BASE + path
+    body = urllib.parse.urlencode(data or {}).encode()
+    h = {
+        "User-Agent": UA, "Accept": "application/json,*/*", "version": "2.4.6",
+        "timestamp": ts, "client-identifier": uid, "request-id": str(uuid.uuid4()).upper(),
+        "Sign": _sign(path, uid, ts),
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+    }
+    if token:
+        h["Authorization"] = token
+    req = urllib.request.Request(url, data=body, headers=h, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8", "ignore"))
+
+
+# ---------- 缺口检测 ----------
+def locate_gap(bg_bgr, piece_bgr):
+    global CV_MT_OK
+    bg = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2GRAY)
+    pw = piece_bgr.shape[1]
+    result = {"x": None, "method": "???"}
+    if CV_MT_OK:
+        try:
+            edges_bg = cv2.Canny(bg, 50, 150)
+            edges_pc = cv2.Canny(cv2.cvtColor(piece_bgr, cv2.COLOR_BGR2GRAY), 50, 150)
+            res = cv2.matchTemplate(edges_bg.astype(np.float32),
+                                    edges_pc.astype(np.float32), cv2.TM_CCOEFF_NORMED)
+            _, mv, _, ml = cv2.minMaxLoc(res)
+            if mv > 0.2:
+                result = {"x": ml[0] + pw // 2, "method": "template", "score": round(float(mv), 3)}
+                return result
+        except BaseException:
+            CV_MT_OK = False
+    # edge 兜底
+    grad = np.abs(cv2.Sobel(bg, cv2.CV_32F, 1, 0, ksize=3))
+    col = grad.mean(axis=0)
+    mean, std = float(col.mean()), float(col.std())
+    thr = mean + 1.8 * std
+    over = [i for i, v in enumerate(col) if v > thr]
+    groups = []
+    for x in over:
+        if groups and x - groups[-1][-1] <= 6:
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    bands = [((g[0] + g[-1]) // 2) for g in groups]
+    best = None
+    for c1 in bands:
+        for c2 in bands:
+            if 30 <= (c2 - c1) <= 160:
+                best = (c1 + c2) // 2
+    if best is None and bands:
+        best = bands[len(bands)//2]
+    result = {"x": best, "method": "edge"}
+    return result
+
+
+def human_track(start, end, dur=0.9):
+    np_rng = np.random.default_rng()
+    steps = int(dur * 120)
+    pts = [start]
+    for i in range(1, steps + 1):
+        t = i / steps
+        eased = start + (end - start) * (1 - (1 - t) ** 5)
+        eased += float(np_rng.uniform(-1.5, 1.5)) * (1 - t)
+        pts.append(int(eased))
+    overshoot = random.randint(2, 5)
+    pts.append(pts[-1] + overshoot)
+    pts.append(pts[-1] - overshoot)
+    pts.append(end)
+    return pts
+
+
+# ---------- 主流程 ----------
+def run(paperid, method):
+    from playwright.sync_api import sync_playwright
+    url = f"https://www.kaoshibao.com/ti/{paperid}"
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=os.environ.get("KSB_HEADLESS", "0") == "1",
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        ctx = browser.new_context(viewport={"width": 1280, "height": 960},
+                                  user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+        page = ctx.new_page()
+        page.goto(url, wait_until="networkidle", timeout=90000)
+        try:
+            page.wait_for_selector("#tCaptchaDyMainWrap", timeout=15000)
+        except Exception:
+            print("验证码未自动触发，尝试点击.", flush=True)
+            for sel in ["text=开始", "text=进入练习", "text=顺序练习", "text=专项练习"]:
+                try:
+                    page.click(sel, timeout=3000); break
+                except Exception:
+                    pass
+            time.sleep(2)
+            try:
+                page.wait_for_selector("#tCaptchaDyMainWrap", timeout=8000)
+            except Exception:
+                print("无验证码或已放行，尝试直接取题库", flush=True)
+
+        # 抓背景 / 拼图
+        def get_img(src_expr):
+            b64 = page.eval_on_selector_all(
+                "#tCaptchaDyMainWrap img", src_expr)
+            if not b64:
+                return None
+            data = base64.b64decode(b64.split(",", 1)[1])
+            return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+        bg = get_img("imgs=>{let e=imgs.find(i=>i.naturalWidth===220&&i.naturalHeight===220);return e?e.src:null}")
+        piece = get_img("imgs=>{let e=imgs.find(i=>i.naturalWidth===124&&i.naturalHeight===124);return e?e.src:null}")
+        print(f"背景={bg.shape if bg is not None else None} 拼图={piece.shape if piece is not None else None}", flush=True)
+
+        gap = locate_gap(bg, piece) if bg is not None else {"x": None}
+        print("缺口定位:", gap, flush=True)
+        # 保存真实背景/拼图供离线校正与核查
+        if bg is not None:
+            cv2.imwrite(os.path.join(OUT, "bg_real.png"), bg)
+        if piece is not None:
+            cv2.imwrite(os.path.join(OUT, "piece_real.png"), piece)
+        if gap["x"] is None:
+            print("无法定位缺口", flush=True)
+            browser.close(); return
+
+        # 保存验证码区域截图，便于诊断缺口/滑块实际位置
+        try:
+            page.screenshot(path=os.path.join(OUT, "captcha_page.png"), full_page=False)
+            print("已保存页面截图 output/captcha_page.png", flush=True)
+        except Exception as e:
+            print("截图失败:", repr(e)[:60], flush=True)
+
+        # 定位可拖拽滑块 — 多选择器容错，动态找几何有效的滑块元素
+        def _box(sel):
+            el = page.query_selector(sel)
+            if not el:
+                return None
+            return el.bounding_box()
+
+        def find_valid_slider():
+            for sel in [
+                ".tencent-captcha-dy__slider-block",
+                ".tencent-captcha-dy__slider-groove",
+                ".tencent-captcha-dy__slider",
+                ".tencent-captcha-dy__opera-area",
+            ]:
+                try:
+                    b = _box(sel)
+                    if b and b.get("width") and b.get("height") and b.get("width") > 4:
+                        return b
+                except Exception:
+                    pass
+            return None
+
+        slider_box = find_valid_slider()
+        if not slider_box:
+            print("❌ 找不到可拖拽滑块元素(可能验证码未完全加载或页面状态异常)", flush=True)
+            # 打印容器内所有元素的 bounding_box 供诊断
+            try:
+                page.eval_on_selector_all("#tCaptchaDyMainWrap *",
+                    "els=>els.map(e=>({c:e.className,w:e.getBoundingClientRect().width,h:e.getBoundingClientRect().height,x:e.getBoundingClientRect().x})).filter(o=>o.w>5&&o.h>5).slice(0,40) ")
+            except Exception as e:
+                print("enum err", repr(e)[:60], flush=True)
+            browser.close(); return
+
+        # 背景图显示宽度换算拖动距离
+        cb_el = page.query_selector(".tencent-captcha-dy__image-area")
+        cb = 220.0
+        if cb_el:
+            b = cb_el.bounding_box()
+            if b and b["width"]:
+                cb = b["width"]
+        ratio = cb / 220.0
+        dist = int(round(gap["x"] * ratio))
+        print(f"背景显示宽={round(cb,1)} 缩放={round(ratio,3)} 缺口x={gap['x']} 拖动距离={dist}px", flush=True)
+
+        sx = slider_box["x"] + slider_box["width"] / 2
+        sy = slider_box["y"] + slider_box["height"] / 2
+        print(f"滑块起点 sx={round(sx,1)} sy={round(sy,1)}", flush=True)
+        page.mouse.move(sx, sy)
+        page.mouse.down()
+        track = human_track(0, dist)
+        for px in track:
+            page.mouse.move(sx + px, sy, steps=1)
+            page.wait_for_timeout(random.randint(6, 14))
+        page.mouse.up()
+        print("已释放滑块，等待验证结果…", flush=True)
+        page.wait_for_timeout(3500)
+
+        # 过验后 cookie/token —— 从 cookie 捕获 ticket/身份
+        cookies = ctx.cookies()
+        browsertok = next((c["value"] for c in cookies if c["name"] == "token"), None)
+        # 尝试从 JS 读取腾讯回填空余字段(如有)
+        ticket = None
+        try:
+            ticket = page.evaluate("()=>{try{return window.__tc_ticket||document.querySelector('input[name=ticket]')?.value||''}catch(e){return ''}}")
+        except Exception:
+            ticket = None
+        print("过验 cookie token:", (browsertok[:12] + "…" if browsertok else None),
+              "ticket:", (str(ticket)[:16] + "…" if ticket else None), flush=True)
+
+        dump = {"paperid": paperid, "gap": gap, "token": browsertok, "ticket": ticket}
+        with open(os.path.join(OUT, "result.json"), "w") as f:
+            json.dump(dump, f, ensure_ascii=False, indent=2)
+        # 文件落到 output 供 artifact 下载
+        print("完成。产物见 output/", flush=True)
+        browser.close()
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--paperid", default="14581066")
+    ap.add_argument("--method", default="template")
+    a = ap.parse_args()
+    print("OpenCV:", cv2.__version__, "matchTemplate可用:", CV_MT_OK, flush=True)
+    run(a.paperid, a.method)
