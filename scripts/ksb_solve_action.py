@@ -325,26 +325,46 @@ def run(paperid, method):
             return gone or has_full_tok
 
         passage = None
+        # 用 CDP Input 事件驱动拖动(trusted 事件, 腾讯能识别为真输入, 而 page.mouse 是合成事件)
+        try:
+            cdp = page.context.new_cdp_session(page)
+        except Exception as e:
+            print("cdp init fail", repr(e)[:60], flush=True); cdp = None
+        def cdp_move(x, y, buttons=1):
+            if cdp:
+                cdp.send("Input.dispatchMouseEvent", {"type":"mouseMoved","x":x,"y":y,
+                        "button":"left","buttons":buttons})
+            else:
+                page.mouse.move(x, y)
+        def cdp_down(x, y):
+            if cdp:
+                cdp.send("Input.dispatchMouseEvent", {"type":"mousePressed","x":x,"y":y,
+                        "button":"left","buttons":1,"clickCount":1})
+            else:
+                page.mouse.move(x,y); page.mouse.down()
+        def cdp_up(x, y):
+            if cdp:
+                cdp.send("Input.dispatchMouseEvent", {"type":"mouseReleased","x":x,"y":y,
+                        "button":"left","buttons":0,"clickCount":1})
+            else:
+                page.mouse.up()
+
         for idx, cxx in enumerate(cands):
             dist = int(round(cxx * ratio))
             print(f"[尝试{idx+1}/{len(cands)}] 缺口候选x={cxx} 拖动={dist}px", flush=True)
-            # 在滑块元素上按下并拖动(浏览器原生级, 腾讯能收到真实指针事件)
             try:
-                page.mouse.move(sx, sy)
-                page.wait_for_timeout(random.randint(80, 200))
-                page.mouse.down()
-                page.wait_for_timeout(random.randint(30, 90))
+                cdp_down(sx, sy)
+                page.wait_for_timeout(random.randint(40, 120))
             except Exception as e:
                 print("down err", repr(e)[:60], flush=True)
             track = human_track(0, dist)
             for px, yj in track:
-                page.mouse.move(sx + px, sy + yj, steps=1)
-                # 真实人非匀速: 停顿有时长有时短
-                page.wait_for_timeout(random.choice([3,4,5,6,8,10,13,16]))
+                cdp_move(sx + px, sy + yj)
+                page.wait_for_timeout(random.choice([4,5,6,8,11,14,17]))
             # 释放前微停
-            page.wait_for_timeout(random.randint(60, 160))
-            page.mouse.up()
-            page.wait_for_timeout(1800)
+            page.wait_for_timeout(random.randint(60, 180))
+            cdp_up(sx + dist, sy)
+            page.wait_for_timeout(2000)
             st = captcha_state()
             print(f"    状态: msg={st.get('msg')} fail={st.get('fail')} success={st.get('success')}", flush=True)
             if captcha_passed():
@@ -353,10 +373,10 @@ def run(paperid, method):
                 break
             # 失败回弹: 拖回起点, 便于下一候选
             try:
-                page.mouse.move(sx, sy)
-                page.mouse.down()
-                page.mouse.move(sx + random.randint(6, 20), sy, steps=2)
-                page.mouse.up()
+                cdp_move(sx, sy); page.wait_for_timeout(30)
+                cdp_down(sx, sy)
+                cdp_move(sx + random.randint(6,20), sy)
+                cdp_up(sx + random.randint(6,20), sy)
             except Exception:
                 pass
             page.wait_for_timeout(700)
